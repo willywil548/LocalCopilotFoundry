@@ -1,0 +1,331 @@
+﻿using Microsoft.AI.Foundry.Local;
+using Microsoft.Extensions.Logging;
+
+namespace FoundrySdkServer
+{
+    public interface IFoundryModelService
+    {
+        Task InitializeAsync(string? deviceTypePreference = null, string? modelAliasPreference = null, CancellationToken cancellationToken = default);
+        Task<ChatCompletionResponse> CompleteChatAsync(ChatCompletionRequest request, CancellationToken cancellationToken = default);
+        IAsyncEnumerable<ChatCompletionStreamResponse> CompleteChatStreamAsync(ChatCompletionRequest request, CancellationToken cancellationToken = default);
+        bool IsInitialized { get; }
+        string? CurrentModelName { get; }
+        void Dispose();
+    }
+
+    public class FoundryModelService : IFoundryModelService, IAsyncDisposable
+    {
+        private readonly ILogger<FoundryModelService> _logger;
+        private readonly CancellationTokenSource _serviceCts = new();
+        private FoundryLocalManager? _manager;
+        private dynamic? _chatClient;
+        private IModel? _selectedModel;
+        private bool _isInitialized;
+
+        public bool IsInitialized => _isInitialized;
+        public string? CurrentModelName => _selectedModel?.Info.DisplayName;
+
+        public FoundryModelService(ILogger<FoundryModelService> logger)
+        {
+            _logger = logger;
+        }
+
+        public async Task InitializeAsync(string? deviceTypePreference = null, string? modelAliasPreference = null, CancellationToken cancellationToken = default)
+        {
+            if (_isInitialized)
+            {
+                _logger.LogWarning("Service is already initialized");
+                return;
+            }
+
+            try
+            {
+                _logger.LogInformation("Initializing Foundry Local SDK...");
+
+                // Create configuration
+                var config = new Configuration
+                {
+                    AppName = "Copilot Foundry Proxy",
+                    LogLevel = Microsoft.AI.Foundry.Local.LogLevel.Verbose,
+                    LogsDir = Path.Combine(Environment.CurrentDirectory, "logs")
+                };
+
+                // Initialize manager
+                await FoundryLocalManager.CreateAsync(config, _logger, cancellationToken);
+                _manager = FoundryLocalManager.Instance ?? throw new InvalidOperationException("Failed to initialize FoundryLocalManager");
+
+                // Discover and register execution providers
+                _logger.LogInformation("Discovering execution providers...");
+                var eps = _manager.DiscoverEps();
+                _logger.LogInformation($"Found {eps.Length} execution provider(s)");
+
+                if (eps.Length > 0)
+                {
+                    _logger.LogInformation("Downloading and registering execution providers...");
+                    await _manager.DownloadAndRegisterEpsAsync((epName, percent) =>
+                    {
+                        if (percent % 25 == 0) // Log at 0%, 25%, 50%, 75%, 100%
+                        {
+                            _logger.LogInformation($"  {epName}: {percent:F1}%");
+                        }
+                    }, cancellationToken);
+                }
+
+                // Get catalog and filter models
+                _logger.LogInformation("Getting available models...");
+                ICatalog catalog = await _manager.GetCatalogAsync(cancellationToken);
+
+                // Parse device type preference
+                DeviceType device = DeviceType.CPU;
+                if (!string.IsNullOrEmpty(deviceTypePreference) && Enum.TryParse<DeviceType>(deviceTypePreference, true, out var parsedDevice))
+                {
+                    device = parsedDevice;
+                }
+
+                var filteredModels = new List<IModel>();
+                foreach (IModel model in await catalog.ListModelsAsync(cancellationToken))
+                {
+                    // Match user's device with model's device type
+                    if (!string.Equals(model.Info.Runtime?.DeviceType.ToString(), device.ToString(), StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    // Filter for tool-calling capable models
+                    if (!model.Info.SupportsToolCalling.HasValue || !model.Info.SupportsToolCalling.Value)
+                    {
+                        continue;
+                    }
+
+                    filteredModels.Add(model);
+                }
+
+                if (filteredModels.Count == 0)
+                {
+                    throw new InvalidOperationException($"No compatible models found for device type: {device}");
+                }
+
+                // Select model (by preference or first available)
+                IModel? selectedModel = null;
+                if (!string.IsNullOrEmpty(modelAliasPreference))
+                {
+                    selectedModel = filteredModels.FirstOrDefault(m => m.Alias == modelAliasPreference);
+                }
+                selectedModel ??= filteredModels[0];
+
+                _logger.LogInformation($"Selected model: {selectedModel.Info.DisplayName} ({selectedModel.Alias})");
+                _selectedModel = selectedModel;
+
+                // Download and load model
+                IModel catalogModel = await catalog.GetModelAsync(selectedModel.Alias, cancellationToken) 
+                    ?? throw new InvalidOperationException("Model not found in catalog");
+
+                _logger.LogInformation($"Downloading model: {catalogModel.Info.DisplayName}");
+                await catalogModel.DownloadAsync(progress =>
+                {
+                    if (progress % 25 == 0)
+                    {
+                        _logger.LogInformation($"  Download progress: {progress:F2}%");
+                    }
+                }, cancellationToken);
+
+                _logger.LogInformation("Loading model into memory...");
+                await catalogModel.LoadAsync(cancellationToken);
+                _selectedModel = catalogModel;
+
+                // Get chat client
+                _chatClient = await catalogModel.GetChatClientAsync();
+
+                _isInitialized = true;
+                _logger.LogInformation($"Model loaded successfully: {catalogModel.Info.DisplayName}");
+                _logger.LogInformation($"Max input tokens: {catalogModel.Info.ContextLength - catalogModel.Info.MaxOutputTokens}");
+                _logger.LogInformation($"Max output tokens: {catalogModel.Info.MaxOutputTokens}");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to initialize Foundry service");
+                throw;
+            }
+        }
+
+        public async Task<ChatCompletionResponse> CompleteChatAsync(ChatCompletionRequest request, CancellationToken cancellationToken = default)
+        {
+            if (!_isInitialized || _chatClient == null || _selectedModel == null)
+            {
+                throw new InvalidOperationException("Service not initialized");
+            }
+
+            try
+            {
+                var messages = request.Messages.Select(m => new Betalgo.Ranul.OpenAI.ObjectModels.RequestModels.ChatMessage
+                {
+                    Role = m.Role,
+                    Content = m.Content
+                }).ToList();
+
+                var response = await _chatClient.CompleteChatAsync(messages, cancellationToken);
+
+                var fullContent = string.Empty;
+                if (response?.Choices?.Count > 0)
+                {
+                    fullContent = response.Choices[0].Message?.Content ?? string.Empty;
+                }
+
+                return new ChatCompletionResponse
+                {
+                    Id = GenerateRequestId(),
+                    Model = _selectedModel.Alias,
+                    Created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                    Choices = new List<ChatChoice>
+                    {
+                        new ChatChoice
+                        {
+                            Index = 0,
+                            Message = new ChatMessage { Role = "assistant", Content = fullContent },
+                            FinishReason = "stop"
+                        }
+                    },
+                    Usage = new ChatUsage
+                    {
+                        PromptTokens = 0,
+                        CompletionTokens = 0,
+                        TotalTokens = 0
+                    }
+                };
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error during chat completion");
+                throw;
+            }
+        }
+
+        public async IAsyncEnumerable<ChatCompletionStreamResponse> CompleteChatStreamAsync(ChatCompletionRequest request, CancellationToken cancellationToken = default)
+        {
+            if (!_isInitialized || _chatClient == null || _selectedModel == null)
+            {
+                throw new InvalidOperationException("Service not initialized");
+            }
+
+            var messages = request.Messages.Select(m => new Betalgo.Ranul.OpenAI.ObjectModels.RequestModels.ChatMessage
+            {
+                Role = m.Role,
+                Content = m.Content
+            }).ToList();
+
+            var requestId = GenerateRequestId();
+            var created = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+            // Yield initial message with role
+            yield return new ChatCompletionStreamResponse
+            {
+                Id = requestId,
+                Model = _selectedModel.Alias,
+                Created = created,
+                Choices = new List<ChatStreamChoice>
+                {
+                    new ChatStreamChoice
+                    {
+                        Index = 0,
+                        Delta = new ChatDelta { Role = "assistant", Content = null }
+                    }
+                }
+            };
+
+            try
+            {
+                // Stream the response
+                var streamingResponse = _chatClient.CompleteChatStreamingAsync(messages, cancellationToken);
+                var enumerator = streamingResponse.GetAsyncEnumerator(cancellationToken);
+
+                while (await enumerator.MoveNextAsync())
+                {
+                    var chunk = enumerator.Current;
+                    var content = chunk?.Choices?[0]?.Message?.Content;
+                    if (!string.IsNullOrEmpty(content))
+                    {
+                        yield return new ChatCompletionStreamResponse
+                        {
+                            Id = requestId,
+                            Model = _selectedModel.Alias,
+                            Created = created,
+                            Choices = new List<ChatStreamChoice>
+                            {
+                                new ChatStreamChoice
+                                {
+                                    Index = 0,
+                                    Delta = new ChatDelta { Content = content }
+                                }
+                            }
+                        };
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error during streaming chat completion");
+                throw;
+            }
+
+            // Yield final message
+            yield return new ChatCompletionStreamResponse
+            {
+                Id = requestId,
+                Model = _selectedModel.Alias,
+                Created = created,
+                Choices = new List<ChatStreamChoice>
+                {
+                    new ChatStreamChoice
+                    {
+                        Index = 0,
+                        Delta = new ChatDelta(),
+                        FinishReason = "stop"
+                    }
+                }
+            };
+        }
+
+        public void Dispose()
+        {
+            _serviceCts.Cancel();
+            _serviceCts.Dispose();
+            _chatClient = null;
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            if (_selectedModel != null)
+            {
+                _logger.LogInformation("Unloading model...");
+                try
+                {
+                    await _selectedModel.UnloadAsync(_serviceCts.Token);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error unloading model");
+                }
+            }
+
+            if (_manager != null)
+            {
+                _logger.LogInformation("Stopping web service...");
+                try
+                {
+                    await _manager.StopWebServiceAsync();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error stopping web service");
+                }
+            }
+
+            Dispose();
+        }
+
+        private static string GenerateRequestId()
+        {
+            return $"chatcmpl-{Guid.NewGuid().ToString("N").Substring(0, 24)}";
+        }
+    }
+}

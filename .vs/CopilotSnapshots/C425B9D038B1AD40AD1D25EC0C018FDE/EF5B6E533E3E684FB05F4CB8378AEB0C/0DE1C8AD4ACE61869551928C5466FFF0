@@ -1,0 +1,246 @@
+﻿using Betalgo.Ranul.OpenAI.ObjectModels.RequestModels;
+using Microsoft.AI.Foundry.Local;
+using Microsoft.Extensions.Logging;
+using static Betalgo.Ranul.OpenAI.ObjectModels.RealtimeModels.RealtimeEventTypes;
+
+namespace FoundrySdkServer
+{
+    internal class Program
+    {
+        private static CancellationTokenSource cts = new CancellationTokenSource();
+
+        static async Task Main(string[] args)
+        {
+            Console.OutputEncoding = System.Text.Encoding.UTF8; // Ensure the console can display UTF-8 characters correctly.
+            Console.CancelKeyPress += (sender, eventArgs) =>
+            {
+                Console.WriteLine("Cancellation requested. Shutting down...");
+                cts.Cancel();
+                eventArgs.Cancel = true; // Prevent the process from terminating immediately.
+            };
+            try
+            {
+                Console.WriteLine("Hello, World! Welcome to Foundry Local SDK");
+                Console.WriteLine("What type of device are you using?");
+                string? deviceType = Console.ReadLine();
+
+                DeviceType device = DeviceType.CPU; // Default to CPU
+                while (!Enum.TryParse<DeviceType>(deviceType, true, out device))
+                {
+                    deviceType = Console.ReadLine();
+                }
+
+                Console.WriteLine($"User wanted: {deviceType} and was mapped to: {device}");
+
+                var config = new Configuration
+                {
+                    AppName = "Copilot Foundry Proxy",
+                    LogLevel = Microsoft.AI.Foundry.Local.LogLevel.Verbose,
+                    LogsDir = Path.Combine(Environment.CurrentDirectory, "logs")
+                };
+
+                using var loggerFactory = LoggerFactory.Create(builder =>
+                {
+                    builder.SetMinimumLevel(Microsoft.Extensions.Logging.LogLevel.Information);
+                });
+                var logger = loggerFactory.CreateLogger<Program>();
+
+                await FoundryLocalManager.CreateAsync(config, logger, cts.Token);
+                var mgr = FoundryLocalManager.Instance;
+
+                // Update EPs.
+                Console.WriteLine("Fetching EPs...");
+
+
+
+                // Discover available execution providers and their registration status.
+                var eps = mgr.DiscoverEps();
+                int maxNameLen = 30;
+                Console.WriteLine("Available execution providers:");
+                Console.WriteLine($"  {"Name".PadRight(maxNameLen)}  Registered");
+                Console.WriteLine($"  {new string('─', maxNameLen)}  {"──────────"}");
+                foreach (var ep in eps)
+                {
+                    Console.WriteLine($"  {ep.Name.PadRight(maxNameLen)}  {ep.IsRegistered}");
+                }
+
+                // Download and register all execution providers with per-EP progress.
+                // EP packages include dependencies and may be large.
+                // Download is only required again if a new version of the EP is released.
+                // For cross platform builds there is no dynamic EP download and this will return immediately.
+                Console.WriteLine("\nDownloading execution providers:");
+                if (eps.Length > 0)
+                {
+                    string currentEp = "";
+                    await mgr.DownloadAndRegisterEpsAsync((epName, percent) =>
+                    {
+                        if (epName != currentEp)
+                        {
+                            if (currentEp != "")
+                            {
+                                Console.WriteLine();
+                            }
+                            currentEp = epName;
+                        }
+                        Console.Write($"\r  {epName.PadRight(maxNameLen)}  {percent,6:F1}%");
+                    });
+                    Console.WriteLine();
+                }
+                else
+                {
+                    Console.WriteLine("No execution providers to download.");
+                }
+
+                Console.WriteLine("Getting the available models...");
+                ICatalog catalog = await mgr.GetCatalogAsync(cts.Token);
+                List<IModel> filteredModels = new List<IModel>();
+                foreach (IModel model in await catalog.ListModelsAsync(cts.Token))
+                {
+                    // match user's device with model's device type
+                    if (!string.Equals(model.Info.Runtime?.DeviceType.ToString(), device.ToString(), StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    // Since this is done for copilot, we want to filter out models that are not compatible with copilot. For example, we can filter out models that do not support the "text-davinci-003" architecture.
+                    if (!model.Info.SupportsToolCalling.HasValue || !model.Info.SupportsToolCalling.Value)
+                    {
+                        continue;
+                    }
+
+                    filteredModels.Add(model);
+                }
+
+                // Please select from one of the available models that match your device type and are compatible with copilot:
+                int maxModelsToShow = filteredModels.Count;
+                string? selection = null;
+                do
+                {
+                    Console.WriteLine("Please select from one of the available models that match your device type and are compatible with copilot:");
+                    int x = 0;
+                    foreach (IModel filteredModel in filteredModels)
+                    {
+                        Console.WriteLine($"{x}. Model: {filteredModel.Info.DisplayName}, DeviceType: {filteredModel.Info.Runtime?.DeviceType}. Supporting Tasks: {filteredModel.Info.Task}");
+                        x++;
+                    }
+
+                    selection = Console.ReadLine();
+                } while (selection != null && (!int.TryParse(selection, out int selectedIndex) || selectedIndex < 0 || selectedIndex >= maxModelsToShow));
+
+                // Assign selected model
+                IModel selectedModel = filteredModels[int.Parse(selection!)];
+
+                // Stop the web service:
+                await mgr.StopWebServiceAsync();
+
+                IModel selectedCatalogModel = await catalog.GetModelAsync(selectedModel.Alias, cts.Token) ?? throw new Exception("Model not found");
+                await selectedCatalogModel.DownloadAsync(progress =>
+                {
+                    Console.Write($"\rDownloading model: {progress:F2}%");
+                    if (progress >= 100f)
+                    {
+                        Console.WriteLine();
+                    }
+                }, cts.Token);
+
+                Console.WriteLine("Loading model into memory, please wait...");
+                await selectedCatalogModel.LoadAsync(cts.Token);
+
+                Console.WriteLine($"Model loaded:{selectedCatalogModel.Info.DisplayName}");
+
+
+                // Get a chat client
+                var chatClient = await selectedCatalogModel.GetChatClientAsync();
+
+                // Internal test to see if it works :?
+                const string exitCommand = "/exit";
+                string userInput = string.Empty;
+                var messages = new List<ChatMessage>
+                {
+                    new ChatMessage
+                    {
+                        Role = "system",
+                        Content = "You are a helpful, friendly assistant. Keep your responses " +
+                                  "concise and conversational. If you don't know something, say so."
+                    }
+                };
+
+                // Prompt the user for input and stream the response until they type the exit command
+                Console.WriteLine("Is there some to discuss first? /exit to continue...\r\n");
+                do
+                {
+                    Console.Write("You: ");
+                    userInput = Console.ReadLine();
+                    if (string.IsNullOrEmpty(userInput))
+                    {
+                        Console.WriteLine("I didn't quite get that. /exit to continue to start the server or ctrl+c to unload.");
+                        continue;
+                    }
+
+                    if (cts.IsCancellationRequested)
+                    {
+                        Console.WriteLine("Cancellation requested. Exiting...");
+                        break;
+                    }
+
+                    if (string.Equals(userInput, exitCommand, StringComparison.OrdinalIgnoreCase))
+                    {
+                        break;
+                    }
+
+                    if (string.IsNullOrWhiteSpace(userInput) ||
+                        userInput.Equals("quit", StringComparison.OrdinalIgnoreCase) ||
+                        userInput.Equals("exit", StringComparison.OrdinalIgnoreCase))
+                    {
+                        break;
+                    }
+
+                    // Add the user's message to conversation history
+                    messages.Add(new ChatMessage { Role = "user", Content = userInput });
+
+                    // Stream the response token by token
+                    Console.Write("Assistant:");
+                    var fullResponse = string.Empty;
+                    var streamingResponse = chatClient.CompleteChatStreamingAsync(messages, cts.Token);
+                    await foreach (var chunk in streamingResponse)
+                    {
+                        var content = chunk.Choices[0].Message.Content;
+                        if (!string.IsNullOrEmpty(content))
+                        {
+                            Console.Write(content);
+                            Console.Out.Flush();
+                            fullResponse += content;
+                        }
+                    }
+                    Console.WriteLine("\n");
+
+                    // Add the complete response to conversation history
+                    messages.Add(new ChatMessage { Role = "assistant", Content = fullResponse });
+                } while (!string.Equals(userInput, exitCommand, StringComparison.OrdinalIgnoreCase));
+
+
+                // Start the web service with the selected model
+                await mgr.StartWebServiceAsync(cts.Token);
+                Console.WriteLine("Foundry Local SDK is running. Please use the endpoint to send requests to the model.");
+                foreach (var url in mgr.Urls)
+                {
+                    Console.WriteLine("Url: " + url);
+                }
+
+                Console.WriteLine($"Max Input Token Length: {selectedCatalogModel.Info.ContextLength - selectedCatalogModel.Info.MaxOutputTokens}");
+                Console.WriteLine($"Max Output Token Length: {selectedCatalogModel.Info.MaxOutputTokens}");
+                Console.WriteLine($"Model id: {selectedCatalogModel.Info.Id}");
+                Console.WriteLine($"Model Alias: {selectedCatalogModel.Info.Alias}");
+
+                cts.Token.WaitHandle.WaitOne();
+
+                await mgr.StopWebServiceAsync();
+                await selectedCatalogModel.UnloadAsync(cts.Token);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"An error occurred: {ex.Message}");
+            }
+        }
+    }
+}

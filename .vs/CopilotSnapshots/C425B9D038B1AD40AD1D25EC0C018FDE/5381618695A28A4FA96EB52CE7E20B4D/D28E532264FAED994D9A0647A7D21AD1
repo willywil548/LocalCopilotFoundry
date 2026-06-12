@@ -1,0 +1,134 @@
+﻿using FoundrySdkServer;
+using Microsoft.Extensions.Logging;
+
+namespace FoundrySdkServer
+{
+
+}
+
+var builder = WebApplication.CreateBuilder(args);
+
+// Configure to listen only on localhost:5000
+builder.WebHost.ConfigureKestrel(options =>
+{
+    options.ListenLocalhost(5000);
+});
+
+// Add services
+builder.Services.AddSingleton<IFoundryModelService, FoundryModelService>();
+builder.Services.AddLogging(logBuilder =>
+{
+    logBuilder.SetMinimumLevel(LogLevel.Information);
+    logBuilder.AddConsole();
+});
+
+var app = builder.Build();
+
+// Request logging middleware for traffic inspection
+app.Use(async (context, next) =>
+{
+    var logger = context.RequestServices.GetRequiredService<ILogger<Program>>();
+
+    logger.LogInformation(
+        "Inbound request: {Method} {Path}{Query}",
+        context.Request.Method,
+        context.Request.Path,
+        context.Request.QueryString);
+
+    // Read and log request body if it's a POST
+    if (context.Request.Method == "POST")
+    {
+        context.Request.EnableBuffering();
+        using var reader = new StreamReader(context.Request.Body, leaveOpen: true);
+        var body = await reader.ReadToEndAsync();
+        context.Request.Body.Position = 0;
+
+        if (!string.IsNullOrEmpty(body))
+        {
+            logger.LogInformation("Request body: {Body}", body);
+        }
+    }
+
+    await next(context);
+});
+
+// Initialize service and endpoints
+var modelService = app.Services.GetRequiredService<IFoundryModelService>();
+var logger = app.Services.GetRequiredService<ILogger<Program>>();
+
+try
+{
+    logger.LogInformation("Initializing Foundry model service...");
+
+    // Get device type and model preference from command line args or environment
+    string? deviceType = args.FirstOrDefault(arg => arg.StartsWith("--device="))?.Split('=')[1] ?? 
+                        Environment.GetEnvironmentVariable("FOUNDRY_DEVICE");
+    string? modelAlias = args.FirstOrDefault(arg => arg.StartsWith("--model="))?.Split('=')[1] ?? 
+                        Environment.GetEnvironmentVariable("FOUNDRY_MODEL");
+
+    await modelService.InitializeAsync(deviceType, modelAlias);
+    logger.LogInformation("Model service initialized successfully");
+}
+catch (Exception ex)
+{
+    logger.LogError(ex, "Failed to initialize model service");
+    Environment.Exit(1);
+}
+
+// Health check endpoint
+app.MapGet("/health", () => Results.Ok(new { status = "healthy", model = modelService.CurrentModelName }))
+    .WithName("Health");
+
+// OpenAI-compatible chat completions endpoint
+app.MapPost("/v1/chat/completions", HandleChatCompletion)
+    .WithName("ChatCompletions");
+
+// Graceful shutdown
+var cts = new CancellationTokenSource();
+Console.CancelKeyPress += (sender, eventArgs) =>
+{
+    logger.LogInformation("Shutdown signal received");
+    cts.Cancel();
+    eventArgs.Cancel = true;
+};
+
+app.Lifetime.ApplicationStopping.Register(async () =>
+{
+    logger.LogInformation("Application stopping, cleaning up resources...");
+    await modelService.DisposeAsync();
+});
+
+logger.LogInformation("Starting web service on http://localhost:5000");
+logger.LogInformation("OpenAI-compatible endpoint: POST http://localhost:5000/v1/chat/completions");
+logger.LogInformation("Health check: GET http://localhost:5000/health");
+
+await app.RunAsync();
+
+// Handler for chat completions endpoint
+async Task<IResult> HandleChatCompletion(ChatCompletionRequest request, CancellationToken cancellationToken)
+{
+    if (!modelService.IsInitialized)
+    {
+        return Results.StatusCode(503);
+    }
+
+    try
+    {
+        if (request.Stream)
+        {
+            // Return a custom result that handles streaming
+            return new StreamingChatResult(modelService, request, cancellationToken, logger);
+        }
+        else
+        {
+            // Non-streaming response
+            var response = await modelService.CompleteChatAsync(request, cancellationToken);
+            return Results.Ok(response);
+        }
+    }
+    catch (Exception ex)
+    {
+        logger.LogError(ex, "Error processing chat completion request");
+        return Results.StatusCode(500);
+    }
+}
