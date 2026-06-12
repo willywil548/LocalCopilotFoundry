@@ -1,0 +1,245 @@
+﻿namespace FoundrySdkServer
+{
+    using Microsoft.AI.Foundry.Local;
+    using Microsoft.Extensions.Logging;
+    using OpenAI.Chat;
+    using LogLevel = Microsoft.AI.Foundry.Local.LogLevel;
+
+    public class Program
+    {
+        public static async Task Main(string[] args)
+        {
+            using (CancellationTokenSource cts = new CancellationTokenSource())
+            {
+                await new Program().RunAsync(args, cts);
+            }
+        }
+
+        public async Task RunAsync(string[] args, CancellationTokenSource cts)
+        {
+            Console.OutputEncoding = System.Text.Encoding.UTF8;
+            Console.CancelKeyPress += (sender, eventArgs) =>
+            {
+                Console.WriteLine("Cancellation requested. Shutting down...");
+                cts.Cancel();
+                eventArgs.Cancel = true;
+            };
+
+            try
+            {
+                Console.WriteLine("Hello, World! Welcome to Foundry Local SDK");
+                Console.WriteLine("What type of device are you using?");
+                string? deviceType = Console.ReadLine();
+
+                DeviceType device = DeviceType.CPU;
+                while (!Enum.TryParse<DeviceType>(deviceType, true, out device))
+                {
+                    deviceType = Console.ReadLine();
+                }
+
+                Console.WriteLine($"User wanted: {deviceType} and was mapped to: {device}");
+
+                var config = new Configuration
+                {
+                    AppName = "Copilot Foundry Proxy",
+                    LogLevel = LogLevel.Verbose,
+                    LogsDir = Path.Combine(Environment.CurrentDirectory, "logs")
+                };
+
+                using var loggerFactory = LoggerFactory.Create(builder =>
+                {
+                    builder.SetMinimumLevel(Microsoft.Extensions.Logging.LogLevel.Information);
+                });
+
+                var logger = loggerFactory.CreateLogger<Program>();
+
+                await FoundryLocalManager.CreateAsync(config, logger, cts.Token);
+                var mgr = FoundryLocalManager.Instance;
+
+                Console.WriteLine("Fetching EPs...");
+
+                var eps = mgr.DiscoverEps();
+                int maxNameLen = 30;
+                Console.WriteLine("Available execution providers:");
+                Console.WriteLine($"  {"Name".PadRight(maxNameLen)}  Registered");
+                Console.WriteLine($"  {new string('─', maxNameLen)}  {"──────────"}");
+                foreach (var ep in eps)
+                {
+                    Console.WriteLine($"  {ep.Name.PadRight(maxNameLen)}  {ep.IsRegistered}");
+                }
+
+                Console.WriteLine("\nDownloading execution providers:");
+                if (eps.Length > 0)
+                {
+                    string currentEp = "";
+                    await mgr.DownloadAndRegisterEpsAsync((epName, percent) =>
+                    {
+                        if (epName != currentEp)
+                        {
+                            if (currentEp != "")
+                            {
+                                Console.WriteLine();
+                            }
+                            currentEp = epName;
+                        }
+                        Console.Write($"\r  {epName.PadRight(maxNameLen)}  {percent,6:F1}%");
+                    });
+                    Console.WriteLine();
+                }
+                else
+                {
+                    Console.WriteLine("No execution providers to download.");
+                }
+
+                Console.WriteLine("Getting the available models...");
+                ICatalog catalog = await mgr.GetCatalogAsync(cts.Token);
+                List<IModel> filteredModels = new List<IModel>();
+                foreach (IModel model in await catalog.ListModelsAsync(cts.Token))
+                {
+                    if (!string.Equals(model.Info.Runtime?.DeviceType.ToString(), device.ToString(), StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    if (!model.Info.SupportsToolCalling.HasValue || !model.Info.SupportsToolCalling.Value)
+                    {
+                        continue;
+                    }
+
+                    filteredModels.Add(model);
+                }
+
+                int maxModelsToShow = filteredModels.Count;
+                string? selection = null;
+                do
+                {
+                    Console.WriteLine("Please select from one of the available models that match your device type and are compatible with copilot:");
+                    int x = 0;
+                    foreach (IModel filteredModel in filteredModels)
+                    {
+                        Console.WriteLine($"{x}. Model: {filteredModel.Info.DisplayName}, DeviceType: {filteredModel.Info.Runtime?.DeviceType}. Supporting Tasks: {filteredModel.Info.Task}");
+                        x++;
+                    }
+
+                    selection = Console.ReadLine();
+                } while (selection != null && (!int.TryParse(selection, out int selectedIndex) || selectedIndex < 0 || selectedIndex >= maxModelsToShow));
+
+                IModel selectedModel = filteredModels[int.Parse(selection!)];
+
+                await mgr.StopWebServiceAsync();
+
+                IModel selectedCatalogModel = await catalog.GetModelAsync(selectedModel.Alias, cts.Token) ?? throw new Exception("Model not found");
+                await selectedCatalogModel.DownloadAsync(progress =>
+                {
+                    Console.Write($"\rDownloading model: {progress:F2}%");
+                    if (progress >= 100f)
+                    {
+                        Console.WriteLine();
+                    }
+                }, cts.Token);
+
+                Console.WriteLine("Loading model into memory, please wait...");
+                await selectedCatalogModel.LoadAsync(cts.Token);
+
+                Console.WriteLine($"Model loaded: {selectedCatalogModel.Info.DisplayName}");
+                Console.WriteLine($"Max Input Token Length: {selectedCatalogModel.Info.ContextLength - selectedCatalogModel.Info.MaxOutputTokens}");
+                Console.WriteLine($"Max Output Token Length: {selectedCatalogModel.Info.MaxOutputTokens}");
+                Console.WriteLine($"Model id: {selectedCatalogModel.Info.Id}");
+                Console.WriteLine($"Model Alias: {selectedCatalogModel.Info.Alias}");
+
+                var builder = WebApplication.CreateBuilder(args);
+
+                builder.WebHost.ConfigureKestrel(options =>
+                {
+                    options.ListenLocalhost(5000);
+                });
+
+                builder.Services.AddSingleton<IFoundryModelService, FoundryModelService>();
+                builder.Services.AddLogging(logBuilder =>
+                {
+                    logBuilder.SetMinimumLevel(Microsoft.Extensions.Logging.LogLevel.Information);
+                    logBuilder.AddConsole();
+                });
+
+                var app = builder.Build();
+
+                app.Use(async (context, next) =>
+                {
+                    var reqLogger = context.RequestServices.GetRequiredService<ILogger<Program>>();
+
+                    reqLogger.LogInformation(
+                        "Inbound request: {Method} {Path}{Query}",
+                        context.Request.Method,
+                        context.Request.Path,
+                        context.Request.QueryString);
+
+                    if (context.Request.Method == "POST")
+                    {
+                        context.Request.EnableBuffering();
+                        using var reader = new StreamReader(context.Request.Body, leaveOpen: true);
+                        var body = await reader.ReadToEndAsync();
+                        context.Request.Body.Position = 0;
+
+                        if (!string.IsNullOrEmpty(body))
+                        {
+                            reqLogger.LogInformation("Request body: {Body}", body);
+                        }
+                    }
+
+                    await next(context);
+                });
+
+                var modelService = app.Services.GetRequiredService<IFoundryModelService>();
+
+                app.MapGet("/health", () => Results.Ok(new { status = "healthy", model = modelService.CurrentModelName }))
+                    .WithName("Health");
+
+                app.MapPost("/v1/chat/completions", HandleChatCompletion)
+                    .WithName("ChatCompletions");
+
+                app.Lifetime.ApplicationStopping.Register(async () =>
+                {
+                    logger.LogInformation("Application stopping, cleaning up resources...");
+                    await modelService.DisposeAsync();
+                });
+
+                logger.LogInformation("Starting web service on http://localhost:5000");
+                logger.LogInformation("OpenAI-compatible endpoint: POST http://localhost:5000/v1/chat/completions");
+                logger.LogInformation("Health check: GET http://localhost:5000/health");
+
+                await app.RunAsync();
+
+                async Task<IResult> HandleChatCompletion(ChatCompletionRequest request, CancellationToken cancellationToken)
+                {
+                    if (!modelService.IsInitialized)
+                    {
+                        return Results.StatusCode(503);
+                    }
+
+                    try
+                    {
+                        if (request.Stream)
+                        {
+                            return new StreamingChatResult(modelService, request, cancellationToken, logger);
+                        }
+                        else
+                        {
+                            var response = await modelService.CompleteChatAsync(request, cancellationToken);
+                            return Results.Ok(response);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogError(ex, "Error processing chat completion request");
+                        return Results.StatusCode(500);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Fatal error: {ex.Message}");
+                Environment.Exit(1);
+            }
+        }
+    }
+}
